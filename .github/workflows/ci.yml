@@ -1,0 +1,216 @@
+name: CI
+
+# Builds the USBip installer (x64 and ARM64, Release) with the WDK NuGet
+# packages on a GitHub-hosted Windows runner and, for pushes to master,
+# publishes the installers as a GitHub release.
+#
+# The drivers are test-signed with the project's test certificate
+# (drivers/package/usbip.pfx, CN=USBip), exactly like a local developer build
+# (README: "Set certificate driver signing for package project"). The
+# installer imports that certificate into the Trusted Root store; the target
+# machine must run with test signing enabled (bcdedit /set testsigning on).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+env:
+  CONFIGURATION: Release
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }}
+    # windows-2025 ships Visual Studio 2026 (v145 toolset), the WDK Visual
+    # Studio extension, NuGet, vcpkg and Inno Setup.
+    runs-on: windows-2025
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64, ARM64]
+
+    steps:
+      - name: Checkout (with vcpkg submodule)
+        uses: actions/checkout@v4
+        with:
+          # vcpkg refuses to work from a shallow clone (it needs the git trees
+          # referenced by its versions database), so fetch the full history.
+          fetch-depth: 0
+          submodules: true
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-archives-${{ matrix.platform }}-${{ hashFiles('userspace/wusbip/vcpkg.json', 'userspace/wusbip/vcpkg-configuration.json', 'userspace/wusbip/triplets/**', '.gitmodules') }}
+          restore-keys: |
+            vcpkg-archives-${{ matrix.platform }}-
+
+      - name: Restore NuGet packages cache
+        uses: actions/cache@v4
+        with:
+          path: packages
+          key: nuget-packages-${{ hashFiles('**/packages.config') }}
+
+      - name: Bootstrap vcpkg
+        shell: cmd
+        run: call vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      - name: Restore NuGet packages (WDK, SDK, Inno Setup)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem -Recurse -Filter packages.config -Path drivers, userspace | ForEach-Object {
+            Write-Host "nuget restore $($_.FullName)"
+            nuget restore $_.FullName -PackagesDirectory packages
+            if ($LASTEXITCODE -ne 0) { throw "nuget restore failed for $($_.FullName)" }
+          }
+
+      - name: Configure driver test signing (package.vcxproj.user)
+        shell: pwsh
+        run: |
+          # Same as README "Set certificate driver signing for package project",
+          # which Visual Studio persists into the (git-ignored) .vcxproj.user file.
+          $pfx = (Resolve-Path drivers\package\usbip.pfx).Path
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+            <PropertyGroup>
+              <SignMode>TestSign</SignMode>
+              <TestCertificate>$pfx</TestCertificate>
+              <Password>usbip</Password>
+            </PropertyGroup>
+          </Project>
+          "@ | Set-Content -Path drivers\package\package.vcxproj.user -Encoding utf8
+          Get-Content drivers\package\package.vcxproj.user
+
+      - name: Build solution
+        shell: pwsh
+        run: |
+          msbuild usbip_win2.slnx -m -nologo `
+            -clp:Summary`;Verbosity=minimal `
+            -p:Configuration=$env:CONFIGURATION `
+            -p:Platform=${{ matrix.platform }} `
+            -bl:msbuild-${{ matrix.platform }}.binlog
+          if ($LASTEXITCODE -ne 0) { throw "msbuild failed with exit code $LASTEXITCODE" }
+
+      - name: Save vcpkg binary cache
+        # Save even if a later step fails so that reruns do not rebuild wxWidgets.
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Verify driver package is signed with the project's test certificate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = "${{ matrix.platform }}\$env:CONFIGURATION\package"
+          Get-ChildItem $pkg | Format-Table Name, Length -AutoSize | Out-String | Write-Host
+          $cats = @(Get-ChildItem $pkg -Filter *.cat)
+          if ($cats.Count -ne 2) { throw "expected 2 catalog files in $pkg, found $($cats.Count)" }
+          foreach ($cat in $cats) {
+            $sig = Get-AuthenticodeSignature $cat.FullName
+            $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '<unsigned>' }
+            Write-Host "$($cat.Name): status=$($sig.Status) signer=$subject"
+            if ($subject -ne 'CN=USBip') { throw "$($cat.Name) is not signed with the USBip test certificate" }
+          }
+
+      - name: Collect installer
+        id: installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = "${{ matrix.platform }}\$env:CONFIGURATION"
+          # setup.iss names the file USBip-<version>-<platform>-<configuration>.exe,
+          # upstream releases publish it as USBip-<version>-<platform>.exe.
+          $exe = Get-ChildItem $out -Filter 'USBip-*.exe' | Select-Object -First 1
+          if (-not $exe) { throw "installer not found in $out" }
+          $name = $exe.Name -replace "-$($env:CONFIGURATION.ToLower())\.exe$", '.exe'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $exe.FullName (Join-Path dist $name)
+          Get-FileHash (Join-Path dist $name) -Algorithm SHA256 | Format-List | Out-String | Write-Host
+          "name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: USBip-${{ matrix.platform }}
+          path: dist/*.exe
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msbuild-${{ matrix.platform }}.binlog
+          path: msbuild-${{ matrix.platform }}.binlog
+          if-no-files-found: ignore
+
+  release:
+    name: release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download installers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: USBip-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 -oE 'FILEVERSION [0-9,]+' userspace/usbip/usbip.rc | tr -d '\r' | awk '{print $2}' | tr ',' '.')
+          TAG="${VERSION}-${GITHUB_RUN_NUMBER}"
+          ls -l dist
+          cat > notes.md <<NOTES
+          USBip ${VERSION} built by GitHub Actions run [#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) from ${GITHUB_SHA}.
+
+          ### Requirements
+          - Windows 10 x64 Version 1903 (OS build 18362) and later
+          - Windows 11 ARM64
+          - Windows Server 2022 (OS build 20348) and later. Windows Server 2019 (1809, OS build 17763) is not supported.
+
+          ### Test-signed drivers
+          The drivers in this build are **test-signed** with the project's test certificate (CN=USBip), they are not signed by Microsoft.
+          - Enable test signing **before** installing and reboot: \`bcdedit.exe /set testsigning on\`
+            (test signing cannot be enabled while Secure Boot is on)
+          - The installer imports the test certificate into the Trusted Root store
+          - Do not disable test signing while USBip is installed
+
+          ### Assets
+          $(cd dist && for f in *.exe; do echo "- \`$f\` (SHA256 \`$(sha256sum "$f" | cut -d' ' -f1)\`)"; done)
+          NOTES
+          cat notes.md
+          gh release create "$TAG" dist/*.exe \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            --generate-notes
