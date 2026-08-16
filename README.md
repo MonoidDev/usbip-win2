@@ -13,10 +13,9 @@
 - [Devices](https://github.com/vadimgrn/usbip-win2/wiki#ude-driver-list-of-devices-known-to-work) that work (the list is incomplete)
 
 ## Requirements
-- Windows 10 x64 Version [1903](https://en.wikipedia.org/wiki/Windows_10,_version_1903) (OS build 18362) and later
+- Windows 10 x64 Version [1809](https://en.wikipedia.org/wiki/Windows_10,_version_1809) (OS build 17763) and later
 - Windows 11 ARM64
-- [Windows Server 2022](https://en.wikipedia.org/wiki/Windows_Server_2022) (OS build 20348) and later
-  - Windows Server 2019 is version 1809 (OS build 17763), it is not supported
+- [Windows Server 2019](https://en.wikipedia.org/wiki/Windows_Server_2019) (OS build 17763) and later
 - USB/IP server must support protocol v.1.1.1
 
 ## Key features
@@ -142,6 +141,9 @@ set APPDIR=C:\Program Files\USBip
 "%APPDIR%\devnode.exe" remove %HWID% root
 rem alternative command since Windows 11, version 21H2
 rem pnputil.exe /remove-device /deviceid %HWID% /subtree
+
+rem Windows 10, version 1809 (Windows Server 2019) only, must be executed before the removal of the driver packages
+"%APPDIR%\devnode.exe" filter remove upper USB\ROOT_HUB30 usbip2_filter
 
 rem WARNING: use %%P and %%~nxP if you run this command in a .bat file
 FOR /f %P IN ('findstr /M /L /Q:u "usbip2_filter usbip2_ude" C:\WINDOWS\INF\oem*.inf') DO pnputil.exe /delete-driver %~nxP /uninstall

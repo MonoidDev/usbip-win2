@@ -193,9 +193,10 @@ jobs:
           USBip ${VERSION} built by GitHub Actions run [#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) from ${GITHUB_SHA}.
 
           ### Requirements
-          - Windows 10 x64 Version 1903 (OS build 18362) and later
+          - Windows 10 x64 Version 1809 (OS build 17763) and later
           - Windows 11 ARM64
-          - Windows Server 2022 (OS build 20348) and later. Windows Server 2019 (1809, OS build 17763) is not supported.
+          - Windows Server 2019 (OS build 17763) and later
+            (support for OS build 17763 is specific to this fork, upstream requires 1903 / OS build 18362)
 
           ### Test-signed drivers
           The drivers in this build are **test-signed** with the project's test certificate (CN=USBip), they are not signed by Microsoft.
