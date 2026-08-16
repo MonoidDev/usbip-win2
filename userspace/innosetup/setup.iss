@@ -96,6 +96,7 @@ AlwaysRestart=yes
 MissingRunOnceIdsWarning=no
 
 ; Windows 10, version 1903
+; Windows Server 2022 (OS build 20348) and later, Windows Server 2019 (OS build 17763) is not supported
 MinVersion=10.0.18362
 
 [Messages]

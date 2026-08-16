@@ -15,6 +15,8 @@
 ## Requirements
 - Windows 10 x64 Version [1903](https://en.wikipedia.org/wiki/Windows_10,_version_1903) (OS build 18362) and later
 - Windows 11 ARM64
+- [Windows Server 2022](https://en.wikipedia.org/wiki/Windows_Server_2022) (OS build 20348) and later
+  - Windows Server 2019 is version 1809 (OS build 17763), it is not supported
 - USB/IP server must support protocol v.1.1.1
 
 ## Key features
