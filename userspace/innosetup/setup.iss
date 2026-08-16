@@ -53,6 +53,9 @@
 
 #define CLIENT_HWID "ROOT\USBIP_WIN2\UDE"
 
+; HWID of devices for the filter driver, see usbip2_filter.inf
+#define FILTER_HWID "USB\ROOT_HUB30"
+
 ; Project's test certificate is no longer installed for github releases since 0.9.7.5.
 ; But it is required during the development.
 #define CertFileName "usbip.pfx"
@@ -95,9 +98,8 @@ AlwaysRestart=yes
 ; this app can't be installed more than once
 MissingRunOnceIdsWarning=no
 
-; Windows 10, version 1903
-; Windows Server 2022 (OS build 20348) and later, Windows Server 2019 (OS build 17763) is not supported
-MinVersion=10.0.18362
+; Windows 10, version 1809 (OS build 17763), Windows Server 2019 and later
+MinVersion=10.0.17763
 
 [Messages]
 WelcomeLabel2=This will install [name/ver] on your computer.
@@ -166,9 +168,16 @@ Filename: {sys}\schtasks.exe; Parameters: "/create /tn ""{#TaskDetachAll}"" /f /
 Filename: {sys}\schtasks.exe; Parameters: "/delete /tn ""{#TaskDetachAll}"" /f"; Flags: runhidden; Components: client
 Filename: {app}\devnode.exe; Parameters: "remove {#CLIENT_HWID} root"; Flags: runhidden; Components: client
 
+; Windows 10, version 1809 (Windows Server 2019) does not support AddFilter directive, {#FilterDriver}.inf registers 
+; the filter driver in UpperFilters of the devices and "pnputil /delete-driver ... /uninstall" does not unregister it
+Filename: {app}\devnode.exe; Parameters: "filter remove upper {#FILTER_HWID} {#FilterDriver}"; Flags: runhidden; Components: client; OnlyBelowVersion: 10.0.18362
+
 ; FIXME: findstr cannot search Unicode files, /Q:u switch is used to supress warnings
 Filename: {cmd}; Parameters: "/c FOR /f %P IN ('findstr /M /L /Q:u {#UdeDriver}    {win}\INF\oem*.inf') DO {sys}\pnputil.exe /delete-driver %~nxP /uninstall"; Flags: runhidden; Components: client
 Filename: {cmd}; Parameters: "/c FOR /f %P IN ('findstr /M /L /Q:u {#FilterDriver} {win}\INF\oem*.inf') DO {sys}\pnputil.exe /delete-driver %~nxP /uninstall"; Flags: runhidden; Components: client
+
+; Windows 10, version 1809 (Windows Server 2019): the service of the filter driver can survive the removal of the driver package
+Filename: {sys}\sc.exe; Parameters: "delete {#FilterDriver}"; Flags: runhidden; Components: client; OnlyBelowVersion: 10.0.18362
 
 #if INSTALL_TEST_CERTIFICATE
   Filename: {sys}\certutil.exe; Parameters: "-f -delstore root ""{#CertName}"""; Flags: runhidden

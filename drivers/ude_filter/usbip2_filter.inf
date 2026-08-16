@@ -23,12 +23,18 @@ DefaultDestDir = 13 ; DriverStore
 usbip2_filter.sys = 1
 
 [Manufacturer]
-; Windows 10, version 1903 and later
-%Manufacturer% = Generic, NT$ARCH$.10.0...18362
+; Windows 10, version 1809 (Windows Server 2019) and later.
+; The Models section with the highest build number that is not higher than the OS build number is used.
+%Manufacturer% = Generic, NT$ARCH$.10.0...17763, NT$ARCH$.10.0...18362
 
-[Generic.NT$ARCH$.10.0...18362]
+; Windows 10, version 1809 (OS build 17763), it is Windows Server 2019
+[Generic.NT$ARCH$.10.0...17763]
 ; HWID of "USB Root Hub (USB 3.0)" located on "USBip 3.X Emulated Host Controller"
 ; See C:\Windows\INF\usbhub3.inf
+%DisplayName% = Generic_Inst_1809, USB\ROOT_HUB30
+
+; Windows 10, version 1903 (OS build 18362) and later
+[Generic.NT$ARCH$.10.0...18362]
 %DisplayName% = Generic_Inst, USB\ROOT_HUB30
 
 [Generic_Inst.NT$ARCH$]
@@ -43,6 +49,24 @@ AddFilter = usbip2_filter,,usbip2_filter_Filter_Inst
 FilterPosition = Upper
 
 [Generic_Inst.NT$ARCH$.Services]
+AddService = usbip2_filter,,usbip2_filter_Service_Inst
+
+; Windows 10, version 1809 does not support AddFilter directive, the filter driver is registered 
+; in the legacy way. It is not unregistered by "pnputil /delete-driver <oem#.inf> /uninstall",
+; setup.iss runs "devnode.exe filter remove upper USB\ROOT_HUB30 usbip2_filter" for that.
+; @see Device Filter Driver Ordering, Legacy-equivalent filter registration
+[Generic_Inst_1809.NT$ARCH$]
+CopyFiles = @usbip2_filter.sys
+
+[Generic_Inst_1809.NT$ARCH$.HW]
+AddReg = usbip2_filter_AddReg
+
+[usbip2_filter_AddReg]
+; HKLM\SYSTEM\CurrentControlSet\Enum\USB\ROOT_HUB30\<DEVICE_ID>\UpperFilters
+; 0x00010008 = FLG_ADDREG_TYPE_MULTI_SZ | FLG_ADDREG_APPEND, append this service to the list if it is not there
+HKR,,UpperFilters,0x00010008,usbip2_filter
+
+[Generic_Inst_1809.NT$ARCH$.Services]
 AddService = usbip2_filter,,usbip2_filter_Service_Inst
 
 [usbip2_filter_Service_Inst]

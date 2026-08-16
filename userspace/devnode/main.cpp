@@ -17,6 +17,9 @@
 
 #include <CLI11\CLI11.hpp>
 
+#include <algorithm>
+#include <cwchar>
+
 #include <initguid.h>
 #include <devpkey.h>
 
@@ -40,6 +43,14 @@ struct devnode_remove_args
 {
         std::wstring hwid;
         std::wstring enumerator;
+        bool dry_run{};
+};
+
+struct devfilter_remove_args
+{
+        std::string level; // upper, lower
+        std::wstring hwid;
+        std::wstring service;
         bool dry_run{};
 };
 
@@ -280,6 +291,153 @@ auto remove_devnode(_In_ devnode_remove_args &r)
         return true;
 }
 
+/*
+ * @return true if hwid is one of Hardware Ids of the device
+ */
+auto has_hwid(_In_ HDEVINFO di, _In_ SP_DEVINFO_DATA &dd, _In_ const std::wstring &hwid)
+{
+        DEVPROPTYPE type = DEVPROP_TYPE_EMPTY;
+        std::vector<BYTE> prop(REGSTR_VAL_MAX_HCID_LEN);
+
+        if (auto err = get_device_property(di, dd, DEVPKEY_Device_HardwareIds, type, prop); err || prop.empty()) {
+                return false; // some devices do not have Hardware Ids
+        }
+
+        assert(type == DEVPROP_TYPE_STRING_LIST);
+
+        auto ids = split_multi_sz(as_wstring_view(prop));
+        auto f = [&hwid] (auto &id) { return !_wcsicmp(id.c_str(), hwid.c_str()); };
+
+        return std::ranges::any_of(ids, f);
+}
+
+/*
+ * @param property SPDRP_UPPERFILTERS or SPDRP_LOWERFILTERS
+ * @param filters empty if the property is not set
+ * @return false if error
+ */
+auto get_device_filters(
+        _In_ HDEVINFO di, _In_ SP_DEVINFO_DATA &dd, _In_ DWORD property, _Out_ std::vector<std::wstring> &filters)
+{
+        filters.clear();
+        std::vector<BYTE> prop(REGSTR_VAL_MAX_HCID_LEN);
+
+        for (;;) {
+                if (DWORD type{}, actual{}; // bytes
+                    SetupDiGetDeviceRegistryProperty(di, &dd, property, &type, prop.data(), DWORD(prop.size()), &actual)) {
+                        assert(type == REG_MULTI_SZ);
+                        prop.resize(actual);
+                        filters = split_multi_sz(as_wstring_view(prop));
+                        return true;
+                } else if (auto err = GetLastError(); err == ERROR_INSUFFICIENT_BUFFER) {
+                        prop.resize(actual);
+                } else if (err == ERROR_INVALID_DATA) { // the property does not exist
+                        return true;
+                } else {
+                        errmsg("SetupDiGetDeviceRegistryProperty", L"", err);
+                        return false;
+                }
+        }
+}
+
+/*
+ * @param property SPDRP_UPPERFILTERS or SPDRP_LOWERFILTERS
+ * @param filters the property will be deleted if the list is empty
+ * @see devcon, cmd/cmd_sethwid
+ */
+auto set_device_filters(
+        _In_ HDEVINFO di, _In_ SP_DEVINFO_DATA &dd, _In_ DWORD property, _In_ const std::vector<std::wstring> &filters)
+{
+        auto val = make_multi_sz(filters);
+
+        auto buf = reinterpret_cast<const BYTE*>(val.data());
+        auto len = DWORD(val.size()*sizeof(val[0]));
+
+        if (filters.empty()) { // delete the property
+                buf = nullptr;
+                len = 0;
+        }
+
+        auto ok = SetupDiSetDeviceRegistryProperty(di, &dd, property, buf, len);
+        if (!ok) {
+                errmsg("SetupDiSetDeviceRegistryProperty");
+        }
+
+        return ok;
+}
+
+/*
+ * @return false to continue enumeration
+ */
+auto remove_filter_from_device(
+        _In_ HDEVINFO di, _In_ SP_DEVINFO_DATA &dd, _In_ const devfilter_remove_args &r, _Inout_ int &modified)
+{
+        if (!has_hwid(di, dd, r.hwid)) {
+                return false;
+        }
+
+        auto property = r.level == "lower" ? SPDRP_LOWERFILTERS : SPDRP_UPPERFILTERS;
+
+        std::vector<std::wstring> filters;
+        if (!get_device_filters(di, dd, property, filters)) {
+                return false;
+        }
+
+        auto f = [&svc = r.service] (auto &s) { return !_wcsicmp(s.c_str(), svc.c_str()); };
+        if (!std::erase_if(filters, f)) {
+                return false; // nothing to remove
+        }
+
+        DEVPROPTYPE type = DEVPROP_TYPE_EMPTY;
+        std::vector<BYTE> prop(MAX_DEVICE_ID_LEN);
+
+        if (get_device_property_ex(L"InstanceId", di, dd, DEVPKEY_Device_InstanceId, type, prop) && !prop.empty()) {
+                assert(type == DEVPROP_TYPE_STRING);
+                auto id = as_wstring_view(prop);
+                wprintf(L"%s\n", id.data());
+        }
+
+        if (!r.dry_run && set_device_filters(di, dd, property, filters)) {
+                ++modified;
+        }
+
+        return false;
+}
+
+/*
+ * Remove a filter driver from UpperFilters/LowerFilters of all devices that have given Hardware Id.
+ * 
+ * Windows 10 version 1809 does not support AddFilter directive, usbip2_filter.inf uses AddReg directive
+ * to append the service to UpperFilters of the device. Such filter driver is not removed by
+ * "pnputil /delete-driver <oem#.inf> /uninstall", the device keeps a reference to the missing service
+ * and can fail to start. This command must be executed before the removal of the driver package.
+ * The change takes effect after the restart of the device (reboot).
+ * 
+ * @see devcon, cmd/cmd_sethwid
+ */
+auto remove_device_filter(_In_ const devfilter_remove_args &r)
+{
+        hdevinfo di(SetupDiGetClassDevs(nullptr, nullptr, nullptr, DIGCF_ALLCLASSES)); // present and not present devices
+        if (!di) {
+                errmsg("SetupDiGetClassDevs");
+                return false;
+        }
+
+        int modified{};
+        auto f = [&r, &modified] (auto di, auto &dd) { return remove_filter_from_device(di, dd, r, modified); };
+
+        if (auto err = enum_device_info(di.get(), f)) {
+                errmsg("SetupDiEnumDeviceInfo", L"", err);
+                return false;
+        }
+
+        if (modified) {
+                remind_reboot();
+        }
+
+        return true;
+}
+
 void add_devnode_install_cmd(_In_ CLI::App &app)
 {
         static devnode_install_args r;
@@ -310,6 +468,28 @@ void add_devnode_remove_cmd(_In_ CLI::App &app)
         cmd->callback(pack(std::move(f)));
 }
 
+void add_devfilter_cmds(_In_ CLI::App &app)
+{
+        auto filter = app.add_subcommand("filter", "Manage filter drivers of devices");
+        filter->require_subcommand(1);
+
+        static devfilter_remove_args r;
+        auto cmd = filter->add_subcommand("remove", "Remove a filter driver from all devices with given Hardware Id");
+
+        cmd->add_option("level", r.level, "Filter level")
+                ->check(CLI::IsMember({"upper", "lower"}))
+                ->required();
+
+        cmd->add_option("hwid", r.hwid, "Hardware Id of devices")->required();
+        cmd->add_option("service", r.service, "Service name of the filter driver")->required();
+
+        cmd->add_flag("-n,--dry-run", r.dry_run, 
+                      "Print InstanceId of devices that will be modified instead of modifying them");
+
+        auto f = [&r = r] { return remove_device_filter(r); };
+        cmd->callback(pack(std::move(f)));
+}
+
 } // namespace
 
 
@@ -322,6 +502,7 @@ int wmain(_In_ int argc, _Inout_ wchar_t* argv[])
 
         add_devnode_install_cmd(app);
         add_devnode_remove_cmd(app);
+        add_devfilter_cmds(app);
 
         app.require_subcommand(1);
         CLI11_PARSE(app, argc, argv);
